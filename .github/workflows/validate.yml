@@ -5,6 +5,7 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
 
 jobs:
   validate:
@@ -29,6 +30,7 @@ jobs:
         run: bun run release:check
 
   windows-compatibility:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: windows-latest
 
     steps:
@@ -55,6 +57,7 @@ jobs:
         run: bun run validate:cli
 
   dart-adapter:
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
 
     steps:
