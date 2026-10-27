@@ -16,21 +16,6 @@ function tmpProject() {
 const REPO_ROOT = path.resolve(import.meta.dir, "..");
 const CLI_ENTRY = path.join(REPO_ROOT, "src", "grace.ts");
 
-// On Windows, `bun` on PATH is typically a `.cmd` shim installed via npm. Node's
-// auto-detection for .cmd executables in `spawnSync` is known to return status=null on some
-// installations (reported by the Gemini reviewer on the same branch — their local run got
-// 12 CLI tests exiting with -1 while ours got 13/13 because of Node version differences).
-//
-// Defensive fix: resolve the binary name explicitly by platform.
-//   - win32  -> `bun.cmd` (the npm-shim wrapper that cmd.exe can locate on PATH without shell)
-//   - other  -> `bun`
-//
-// We deliberately do NOT use `shell: true` — that would force cmd.exe to re-parse our args,
-// break string quoting for values with spaces (observed regression: "what next?" became
-// "what" + "next?"), and introduce injection surface for user-controlled test inputs. Naming
-// the binary directly avoids the shell entirely and lets Node.js do its normal arg-escaping.
-const BUN_BIN = process.platform === "win32" ? "bun.cmd" : "bun";
-
 function runCli(cwd: string, args: string[], opts: { home?: string } = {}) {
   // Invoke `bun <file>` rather than `bun run <file>`: `bun run` wraps the child and on Windows
   // does not reliably propagate custom exit codes above a single-digit range (observed: any
@@ -41,7 +26,7 @@ function runCli(cwd: string, args: string[], opts: { home?: string } = {}) {
   // config would flip EXIT_CONFIG_MISSING tests. Every runCli call gets a throwaway home,
   // making tests deterministic regardless of local dev setup.
   const home = opts.home ?? mkdtempSync(path.join(os.tmpdir(), "grace-afk-cli-home-"));
-  const result = spawnSync(BUN_BIN, [CLI_ENTRY, "afk", ...args], {
+  const result = spawnSync(process.execPath, [CLI_ENTRY, "afk", ...args], {
     cwd,
     encoding: "utf8",
     env: {
