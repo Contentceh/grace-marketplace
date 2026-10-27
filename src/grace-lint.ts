@@ -4,13 +4,15 @@ import { defineCommand, type CommandDef, runMain } from "citty";
 
 import { formatLintExplanation, getLintIssueGuide } from "./lint/catalog";
 import { formatTextReport, isValidTextFormat, lintGraceProject } from "./lint/core";
-import type { LintOptions, LintResult } from "./lint/types";
+import type { LintAssertionMode, LintOptions, LintProfile, LintResult } from "./lint/types";
+import { GraceCommandError, runGraceCommand } from "./query/errors";
 
 export type {
   GraceLintConfig,
   LanguageAdapter,
   LanguageAnalysis,
   LintIssue,
+  LintAssertionMode,
   LintOptions,
   LintProfile,
   LintResult,
@@ -30,22 +32,30 @@ function writeResult(format: string, result: LintResult) {
   process.stdout.write(`${formatTextReport(result)}\n`);
 }
 
-function resolveProfile(value: unknown) {
+function resolveProfile(value: unknown): LintProfile {
   const profile = String(value ?? "standard");
-  if (profile !== "standard" && profile !== "autonomous") {
-    throw new Error(`Unsupported profile \`${profile}\`. Use \`standard\` or \`autonomous\`.`);
+  if (profile !== "standard") {
+    throw new GraceCommandError("invalid-arguments", `Unsupported profile \`${profile}\`. Use \`standard\`.`);
   }
 
-  return profile;
+  return "standard";
 }
 
 function resolveFailOn(value: unknown) {
   const failOn = String(value ?? "errors");
   if (failOn !== "errors" && failOn !== "warnings" && failOn !== "never") {
-    throw new Error(`Unsupported fail-on policy \`${failOn}\`. Use \`errors\`, \`warnings\`, or \`never\`.`);
+    throw new GraceCommandError("invalid-arguments", `Unsupported fail-on policy \`${failOn}\`. Use \`errors\`, \`warnings\`, or \`never\`.`);
   }
 
   return failOn;
+}
+
+function resolveAssertionMode(value: unknown): LintAssertionMode {
+  const mode = String(value ?? "current");
+  if (mode !== "current" && mode !== "baseline" && mode !== "target" && mode !== "final") {
+    throw new GraceCommandError("invalid-arguments", `Unsupported assertion mode \`${mode}\`. Use \`current\`, \`baseline\`, \`target\`, or \`final\`.`);
+  }
+  return mode;
 }
 
 function shouldFail(result: LintResult, failOn: string) {
@@ -63,7 +73,7 @@ function shouldFail(result: LintResult, failOn: string) {
 export const lintCommand = defineCommand({
   meta: {
     name: "lint",
-    description: "Lint GRACE artifacts, XML tag conventions, semantic markup, role-aware module maps, and optional autonomy readiness.",
+    description: "Lint GRACE artifacts, XML tag conventions, semantic markup, and role-aware module maps.",
   },
   args: {
     path: {
@@ -80,7 +90,7 @@ export const lintCommand = defineCommand({
     },
     profile: {
       type: "string",
-      description: "Lint profile: standard or autonomous",
+      description: "Lint profile (currently only \`standard\` is supported)",
       default: "standard",
     },
     explain: {
@@ -97,44 +107,166 @@ export const lintCommand = defineCommand({
       description: "Exit policy: errors, warnings, or never",
       default: "errors",
     },
-    allowMissingDocs: {
+    change: {
+      type: "string",
+      description: "Active C-* bundle selected for baseline or target assertion evaluation",
+    },
+    assertions: {
+      type: "string",
+      description: "Assertion mode: current (pre-write active baselines), baseline, target, or final",
+      default: "current",
+    },
+    runCommands: {
       type: "boolean",
-      description: "Allow repositories that do not yet have full GRACE docs",
+      description: "Execute MustPassCommand assertions for the selected change",
+      default: false,
+    },
+    commandTimeout: {
+      type: "string",
+      description: "Per-command timeout in seconds for --run-commands (default 600, 0 disables)",
+      default: "600",
+    },
+    keepRuns: {
+      type: "string",
+      description: "How many non-passing --run-commands run directories to keep (default 10, 0 keeps none); the newest passing run of each change is always kept",
+    },
+    verbose: {
+      type: "boolean",
+      description: "Stream full command output in --run-commands (forces live mode)",
+      default: false,
+    },
+    quiet: {
+      type: "boolean",
+      description: "Suppress streamed command output in --run-commands (forces compact mode)",
+      default: false,
+    },
+    parallelPreflight: {
+      type: "boolean",
+      description: "Treat active-plan scope overlap as a parallel-execution blocker",
       default: false,
     },
   },
   async run(context) {
-    const format = String(context.args.format ?? "text");
-    const profile = resolveProfile(context.args.profile);
-    const failOn = resolveFailOn(context.args.failOn);
-    if (!isValidTextFormat(format)) {
-      throw new Error(`Unsupported format \`${format}\`. Use \`text\` or \`json\`.`);
-    }
+    const errorFormat = context.args.format === "json" ? "json" : "text";
+    await runGraceCommand(errorFormat, async () => {
+      const format = String(context.args.format ?? "text");
+      const profile = resolveProfile(context.args.profile);
+      const failOn = resolveFailOn(context.args.failOn);
+      const assertionMode = resolveAssertionMode(context.args.assertions);
+      if (!isValidTextFormat(format)) {
+        throw new GraceCommandError("invalid-arguments", `Unsupported format \`${format}\`. Use \`text\` or \`json\`.`);
+      }
 
-    if (context.args.explain) {
-      const code = String(context.args.explain);
-      if (format === "json") {
-        process.stdout.write(`${JSON.stringify({ schemaVersion: "1.0.0", tool: "grace-lint", guide: getLintIssueGuide(code) }, null, 2)}\n`);
+      if (context.args.explain) {
+        const code = String(context.args.explain);
+        if (format === "json") {
+          process.stdout.write(`${JSON.stringify({ schemaVersion: "1.0.0", tool: "grace-lint", guide: getLintIssueGuide(code) }, null, 2)}\n`);
+          return;
+        }
+
+        process.stdout.write(`${formatLintExplanation(code)}\n`);
         return;
       }
 
-      process.stdout.write(`${formatLintExplanation(code)}\n`);
-      return;
-    }
+      const verbose = Boolean(context.args.verbose);
+      const quiet = Boolean(context.args.quiet);
+      const timeoutMs = parseCommandTimeoutMs(context.args.commandTimeout);
+      const keepRuns = parseKeepRuns(context.args.keepRuns);
+      const verbosity = resolveCommandVerbosity({
+        format,
+        verbose,
+        quiet,
+        interactive: Boolean(process.stdout.isTTY && process.stderr.isTTY),
+      });
 
-    const result = lintGraceProject(String(context.args.path ?? "."), {
-      allowMissingDocs: Boolean(context.args.allowMissingDocs),
-      profile,
-    });
+      const controller = new AbortController();
+      const onSignal = () => controller.abort();
+      process.once("SIGINT", onSignal);
+      process.once("SIGTERM", onSignal);
 
-    if (format === "json") {
-      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
-    } else {
-      process.stdout.write(`${formatTextReport(result, { remediate: Boolean(context.args.remediate) })}\n`);
-    }
-    process.exitCode = shouldFail(result, failOn) ? 1 : 0;
+      try {
+        const result = await lintGraceProject(String(context.args.path ?? "."), {
+          profile,
+          assertionMode,
+          changeId: context.args.change ? String(context.args.change) : undefined,
+          runCommands: Boolean(context.args.runCommands),
+          parallelPreflight: Boolean(context.args.parallelPreflight),
+          commandTimeoutMs: timeoutMs,
+          runLogRetention: keepRuns,
+          commandVerbosity: verbosity,
+          commandSignal: controller.signal,
+        });
+
+        if (format === "json") {
+          process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+        } else {
+          process.stdout.write(`${formatTextReport(result, { remediate: Boolean(context.args.remediate) })}\n`);
+        }
+        if (controller.signal.aborted) {
+          process.exitCode = 130;
+        } else {
+          process.exitCode = shouldFail(result, failOn) ? 1 : 0;
+        }
+      } finally {
+        process.removeListener("SIGINT", onSignal);
+        process.removeListener("SIGTERM", onSignal);
+      }
+    }, "Unable to complete GRACE lint. Check the project path and run again.");
   },
 });
+
+/** Parses --command-timeout seconds into ms; rejects negative and non-integer values. */
+export function parseCommandTimeoutMs(value: unknown): number {
+  const raw = String(value ?? "600");
+  if (!/^\d+$/.test(raw)) {
+    throw new GraceCommandError("invalid-arguments", `Unsupported --command-timeout \`${raw}\`. Use a non-negative integer number of seconds.`);
+  }
+  return Number(raw) * 1000;
+}
+
+/**
+ * Parses --keepRuns into a run-directory count; undefined when the flag is absent, so
+ * `.grace-lint.json`'s `runLogRetention` still applies. Rejects negative and non-integer
+ * values. `0` keeps no non-passing runs: the newest passing run of each change survives,
+ * everything else — including the current run when it fails — is removed immediately.
+ */
+export function parseKeepRuns(value: unknown): number | undefined {
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  const raw = String(value);
+  if (!/^\d+$/.test(raw)) {
+    throw new GraceCommandError("invalid-arguments", `Unsupported --keepRuns \`${raw}\`. Use a non-negative integer number of run directories.`);
+  }
+  return Number(raw);
+}
+
+/** Input for resolving the --run-commands output verbosity. */
+export type CommandVerbosityInput = {
+  format: string;
+  verbose: boolean;
+  quiet: boolean;
+  /** True when both stdout and stderr are interactive TTYs. */
+  interactive: boolean;
+};
+
+/**
+ * Resolves run-commands verbosity: json output is always compact; --verbose forces live;
+ * --quiet forces compact; otherwise live only for interactive terminals. Rejects the
+ * mutually exclusive --verbose/--quiet combination.
+ */
+export function resolveCommandVerbosity(input: CommandVerbosityInput): "compact" | "live" {
+  if (input.verbose && input.quiet) {
+    throw new GraceCommandError("invalid-arguments", "`--verbose` and `--quiet` are mutually exclusive.");
+  }
+  if (input.format === "json" || input.quiet) {
+    return "compact";
+  }
+  if (input.verbose || input.interactive) {
+    return "live";
+  }
+  return "compact";
+}
 
 if (import.meta.main) {
   await runMain(lintCommand as CommandDef);

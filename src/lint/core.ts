@@ -1,1144 +1,453 @@
-import { existsSync, readFileSync } from "node:fs";
+import { type Dirent, existsSync, readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 
-import { loadGraceLintConfig } from "./config";
-import { getLanguageAdapter } from "./adapters/base";
+import { evaluateAssertion, extractAssertionsWithIssues, filterAssertionIssuesForLifecycle, type AssertionContext, type AssertionExtractionResult, type AssertionLifecycle } from "../grace4/assertions";
+import { formatDuration, runDeclaredCommands, type CommandRunResult, type DeclaredCommand } from "../grace4/command-runner";
+import { validateGrace4Project } from "../grace4/grammar";
+import { detectGraceProjectKind, formatGrace3MigrationGuidance, resolveGrace4Paths } from "../grace4/project";
+import { buildGraphProjection, buildVerificationProjection, type GraphProjection, type VerificationProjection } from "../grace4/projections";
+import { collectActiveChangeScopes, createDurableOwnershipIndex, detectScopeOverlaps, detectUnsafeConcurrentExecution } from "../grace4/scope";
+import { ANCHOR_PATTERNS, type Grace4Issue, type Grace4ProjectPaths } from "../grace4/types";
+import { readGraceXmlArtifact } from "../grace4/xml";
+import { analyzeGovernedFile, collectCodeFiles, describeUnreadableDirectory, hasGraceMarkers, type UnreadableDirectoryHandler } from "../project-utils";
 import { withLintIssueGuide } from "./catalog";
-import { loadGraceArtifactIndex } from "../query/core";
-import {
-  collectCodeFiles,
-  findSection,
-  hasGraceMarkers,
-  lineNumberAt,
-  normalizeRelative,
-  readTextIfExists,
-  stripCommentPrefix,
-} from "../project-utils";
-import type {
-  LanguageAnalysis,
-  LintIssue,
-  LintOptions,
-  LintProfile,
-  LintResult,
-  MapMode,
-  MarkupSection,
-  ModuleContractInfo,
-  ModuleMapItem,
-  ModuleRole,
-} from "./types";
+import { loadGraceLintConfig, resolveRunLogRetention } from "./config";
+import type { CommandEvidence, LintIssue, LintOptions, LintProfile, LintResult } from "./types";
 
-const REQUIRED_DOCS = ["docs/knowledge-graph.xml", "docs/development-plan.xml", "docs/verification-plan.xml"] as const;
-
-const OPTIONAL_PACKET_DOC = "docs/operational-packets.xml";
-const LINT_CONFIG_FILE = ".grace-lint.json";
-
-const UNIQUE_TAG_ANTI_PATTERNS = [
-  {
-    code: "xml.generic-module-tag",
-    regex: /<\/?Module(?=[\s>])/g,
-    message: 'Use unique module tags like `<M-AUTH>` instead of generic `<Module ID="...">`.',
-  },
-  {
-    code: "xml.generic-phase-tag",
-    regex: /<\/?Phase(?=[\s>])/g,
-    message: 'Use unique phase tags like `<Phase-1>` instead of generic `<Phase number="...">`.',
-  },
-  {
-    code: "xml.generic-flow-tag",
-    regex: /<\/?Flow(?=[\s>])/g,
-    message: 'Use unique flow tags like `<DF-LOGIN>` instead of generic `<Flow ID="...">`.',
-  },
-  {
-    code: "xml.generic-use-case-tag",
-    regex: /<\/?UseCase(?=[\s>])/g,
-    message: 'Use unique use-case tags like `<UC-001>` instead of generic `<UseCase ID="...">`.',
-  },
-  {
-    code: "xml.generic-step-tag",
-    regex: /<\/?step(?=[\s>])/g,
-    message: 'Use unique step tags like `<step-1>` instead of generic `<step order="...">`.',
-  },
-  {
-    code: "xml.generic-export-tag",
-    regex: /<\/?export(?=[\s>])/g,
-    message: 'Use unique export tags like `<export-run>` instead of generic `<export name="...">`.',
-  },
-  {
-    code: "xml.generic-function-tag",
-    regex: /<\/?function(?=[\s>])/g,
-    message: 'Use unique function tags like `<fn-run>` instead of generic `<function name="...">`.',
-  },
-  {
-    code: "xml.generic-type-tag",
-    regex: /<\/?type(?=[\s>])/g,
-    message: 'Use unique type tags like `<type-Result>` instead of generic `<type name="...">`.',
-  },
-];
-
-const VALID_ROLES = new Set<ModuleRole>(["RUNTIME", "TEST", "BARREL", "CONFIG", "TYPES", "SCRIPT"]);
-const VALID_MAP_MODES = new Set<MapMode>(["EXPORTS", "LOCALS", "SUMMARY", "NONE"]);
 const TEXT_FORMAT_OPTIONS = new Set(["text", "json"]);
 
-function addAutonomyIssue(
-  result: LintResult,
-  severity: LintIssue["severity"],
-  code: string,
-  file: string,
-  message: string,
-  line?: number,
-) {
-  addIssue(result, {
-    severity,
-    code,
-    file,
-    line,
-    message,
-  });
+/** Default per-command timeout for --run-commands: ten minutes. */
+const DEFAULT_COMMAND_TIMEOUT_MS = 600_000;
+
+function createResult(root: string, profile: LintProfile, options: LintOptions): LintResult {
+  return {
+    schemaVersion: "1.0.0",
+    tool: "grace-lint",
+    generatedAt: new Date().toISOString(),
+    root,
+    profile,
+    assertionMode: options.assertionMode ?? "current",
+    changeId: options.changeId,
+    commandsEnabled: options.runCommands ?? false,
+    filesChecked: 0,
+    governedFiles: 0,
+    xmlFilesChecked: 0,
+    issues: [],
+    summary: { issues: 0, errors: 0, warnings: 0 },
+  };
 }
 
 function addIssue(result: LintResult, issue: LintIssue) {
   result.issues.push(issue);
 }
 
-function ensureSectionPair(
-  result: LintResult,
-  relativePath: string,
-  text: string,
-  startMarker: string,
-  endMarker: string,
-  code: string,
-  message: string,
-) {
-  const startIndex = text.indexOf(startMarker);
-  const endIndex = text.indexOf(endMarker);
-
-  if (startIndex === -1 || endIndex === -1) {
-    addIssue(result, {
-      severity: "error",
-      code,
-      file: relativePath,
-      line: startIndex === -1 ? undefined : lineNumberAt(text, startIndex),
-      message,
-    });
-    return null;
-  }
-
-  if (startIndex > endIndex) {
-    addIssue(result, {
-      severity: "error",
-      code,
-      file: relativePath,
-      line: lineNumberAt(text, endIndex),
-      message: `${message} Found the end marker before the start marker.`,
-    });
-    return null;
-  }
-
-  return {
-    content: text.slice(startIndex + startMarker.length, endIndex),
-    startLine: lineNumberAt(text, startIndex),
-    endLine: lineNumberAt(text, endIndex),
-  } satisfies MarkupSection;
-}
-
-function lintScopedMarkers(
-  result: LintResult,
-  relativePath: string,
-  text: string,
-  startRegex: RegExp,
-  endRegex: RegExp,
-  kind: "block" | "contract",
-) {
-  const lines = text.split("\n");
-  const stack: Array<{ name: string; line: number }> = [];
-  const seen = new Set<string>();
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const line = lines[index];
-    const startMatch = line.match(startRegex);
-    const endMatch = line.match(endRegex);
-
-    if (startMatch?.[1]) {
-      const name = startMatch[1];
-      if (kind === "block") {
-        if (seen.has(name)) {
-          addIssue(result, {
-            severity: "error",
-            code: "markup.duplicate-block-name",
-            file: relativePath,
-            line: index + 1,
-            message: `Semantic block name \`${name}\` is duplicated in this file.`,
-          });
-        }
-
-        seen.add(name);
-      }
-
-      stack.push({ name, line: index + 1 });
-    }
-
-    if (endMatch?.[1]) {
-      const name = endMatch[1];
-      const active = stack[stack.length - 1];
-
-      if (!active) {
-        addIssue(result, {
-          severity: "error",
-          code: kind === "block" ? "markup.unmatched-block-end" : "markup.unmatched-contract-end",
-          file: relativePath,
-          line: index + 1,
-          message: `Found an unmatched END marker for \`${name}\`.`,
-        });
-        continue;
-      }
-
-      if (active.name !== name) {
-        addIssue(result, {
-          severity: "error",
-          code: kind === "block" ? "markup.mismatched-block-end" : "markup.mismatched-contract-end",
-          file: relativePath,
-          line: index + 1,
-          message: `Expected END marker for \`${active.name}\`, found \`${name}\` instead.`,
-        });
-        continue;
-      }
-
-      stack.pop();
-    }
-  }
-
-  for (const active of stack) {
-    addIssue(result, {
-      severity: "error",
-      code: kind === "block" ? "markup.missing-block-end" : "markup.missing-contract-end",
-      file: relativePath,
-      line: active.line,
-      message: `Missing END marker for \`${active.name}\`.`,
-    });
-  }
-}
-
-function parseModuleContract(section: MarkupSection) {
-  const fields: Record<string, string> = {};
-
-  for (const line of section.content.split("\n")) {
-    const cleaned = stripCommentPrefix(line).trim();
-    if (!cleaned) {
-      continue;
-    }
-
-    const match = cleaned.match(/^([A-Z_]+):\s*(.+)$/);
-    if (!match) {
-      continue;
-    }
-
-    fields[match[1]] = match[2].trim();
-  }
-
-  const roleValue = fields.ROLE?.toUpperCase() as ModuleRole | undefined;
-  const mapModeValue = fields.MAP_MODE?.toUpperCase() as MapMode | undefined;
-
-  return {
-    fields,
-    purpose: fields.PURPOSE,
-    scope: fields.SCOPE,
-    depends: fields.DEPENDS,
-    links: fields.LINKS,
-    role: roleValue && VALID_ROLES.has(roleValue) ? roleValue : undefined,
-    mapMode: mapModeValue && VALID_MAP_MODES.has(mapModeValue) ? mapModeValue : undefined,
-  } satisfies ModuleContractInfo;
-}
-
-function toSymbolName(label: string) {
-  return /^(?:default|[A-Za-z_$][\w$]*)$/.test(label) ? label : undefined;
-}
-
-function parseModuleMapItems(section: MarkupSection) {
-  const items: ModuleMapItem[] = [];
-  const lines = section.content.split("\n");
-
-  for (let index = 0; index < lines.length; index += 1) {
-    const cleaned = stripCommentPrefix(lines[index]).trim();
-    if (!cleaned) {
-      continue;
-    }
-
-    const match = cleaned.match(/^(.+?)\s+-\s+.+$/);
-    const label = (match?.[1] ?? cleaned).trim();
-    items.push({
-      label,
-      symbolName: toSymbolName(label),
-      line: section.startLine + index,
-    });
-  }
-
-  return items;
-}
-
-function isBarrelLike(analysis: LanguageAnalysis) {
-  return analysis.hasWildcardReExport || (analysis.directReExportCount > 0 && analysis.localImplementationCount <= 2);
-}
-
-function isAggregationSurface(analysis: LanguageAnalysis) {
-  return isBarrelLike(analysis) || (analysis.directReExportCount >= 2 && analysis.exports.size >= 8);
-}
-
-function inferRole(contract: ModuleContractInfo | null, analysis: LanguageAnalysis | null): ModuleRole {
-  if (contract?.role) {
-    return contract.role;
-  }
-
-  if (analysis?.usesTestFramework) {
-    return "TEST";
-  }
-
-  const contractText = `${contract?.purpose ?? ""} ${contract?.scope ?? ""}`.toLowerCase();
-  const mentionsTypes = /\b(type definition|type definitions|interface|interfaces|types?)\b/.test(contractText);
-  const mentionsConfig = /\b(config|configure|configuration|settings?)\b/.test(contractText);
-  const mentionsBarrel = /\b(barrel|re-export|re-exports|aggregate|entry point|bindings?)\b/.test(contractText);
-  const mentionsScript = /\b(script|scripts|cli|command|commands|bootstrap|smoke|runner|execute|execution|setup|check)\b/.test(contractText);
-
-  if (analysis && analysis.valueExports.size === 0 && analysis.typeExports.size > 0) {
-    return "TYPES";
-  }
-
-  if (analysis && (mentionsBarrel || isBarrelLike(analysis))) {
-    return "BARREL";
-  }
-
-  if (!analysis && mentionsTypes) {
-    return "TYPES";
-  }
-
-  if (analysis && mentionsTypes && analysis.valueExports.size === 0) {
-    return "TYPES";
-  }
-
-  if (analysis && mentionsConfig && analysis.hasDefaultExport && analysis.valueExports.size <= 1) {
-    return "CONFIG";
-  }
-
-  if (analysis?.hasMainEntrypoint) {
-    return "SCRIPT";
-  }
-
-  if (analysis && mentionsScript && analysis.exports.size === 0) {
-    return "SCRIPT";
-  }
-
-  if (mentionsConfig && !analysis) {
-    return "CONFIG";
-  }
-
-  if (!analysis && mentionsScript) {
-    return "SCRIPT";
-  }
-
-  return "RUNTIME";
-}
-
-function inferMapMode(
-  contract: ModuleContractInfo | null,
-  role: ModuleRole,
-  items: ModuleMapItem[],
-  analysis: LanguageAnalysis | null,
-) {
-  if (contract?.mapMode) {
-    return contract.mapMode;
-  }
-
-  if (role === "TEST") {
-    return "LOCALS" as const;
-  }
-
-  if (role === "SCRIPT") {
-    return "LOCALS" as const;
-  }
-
-  if (role === "BARREL") {
-    return "SUMMARY" as const;
-  }
-
-  if (role === "CONFIG") {
-    return "NONE" as const;
-  }
-
-  if (role === "TYPES") {
-    return "EXPORTS" as const;
-  }
-
-  if (items.some((item) => !item.symbolName)) {
-    return "SUMMARY" as const;
-  }
-
-  if (analysis && isAggregationSurface(analysis) && items.length > 0 && analysis.exports.size > items.length * 2) {
-    return "SUMMARY" as const;
-  }
-
-  return "EXPORTS" as const;
-}
-
-function lintUniqueTags(result: LintResult, relativePath: string, text: string) {
-  for (const antiPattern of UNIQUE_TAG_ANTI_PATTERNS) {
-    for (const match of text.matchAll(antiPattern.regex)) {
-      addIssue(result, {
-        severity: "error",
-        code: antiPattern.code,
-        file: relativePath,
-        line: match.index === undefined ? undefined : lineNumberAt(text, match.index),
-        message: antiPattern.message,
-      });
-    }
-  }
-}
-
-function extractModuleIds(text: string) {
-  return new Set(Array.from(text.matchAll(/<(M-[A-Za-z0-9-]+)(?=[\s>])/g), (match) => match[1]));
-}
-
-function extractVerificationIds(text: string) {
-  return new Set(Array.from(text.matchAll(/<(V-M-[A-Za-z0-9-]+)(?=[\s>])/g), (match) => match[1]));
-}
-
-function extractVerificationRefs(text: string) {
-  return Array.from(text.matchAll(/<verification-ref>\s*([^<\s]+)\s*<\/verification-ref>/g)).map((match) => ({
-    value: match[1],
-    line: match.index === undefined ? undefined : lineNumberAt(text, match.index),
-  }));
-}
-
-function extractStepRefs(text: string) {
-  return Array.from(text.matchAll(/<(step-[A-Za-z0-9-]+)([^>]*)>/g), (match) => {
-    const attrs = match[2] ?? "";
-    const moduleMatch = attrs.match(/module="([^"]+)"/);
-    const verificationMatch = attrs.match(/verification="([^"]+)"/);
-    return {
-      stepTag: match[1],
-      moduleId: moduleMatch?.[1] ?? null,
-      verificationId: verificationMatch?.[1] ?? null,
-      line: match.index === undefined ? undefined : lineNumberAt(text, match.index),
-    };
+function addGrace4Issue(result: LintResult, issue: Grace4Issue) {
+  addIssue(result, {
+    severity: issue.severity,
+    code: issue.code,
+    file: issue.file,
+    line: issue.line,
+    message: issue.message,
   });
 }
 
-function lintRequiredPacketSections(result: LintResult, relativePath: string, text: string) {
-  const requiredTags = [
-    "ExecutionPacketTemplate",
-    "GraphDeltaTemplate",
-    "VerificationDeltaTemplate",
-    "FailurePacketTemplate",
-  ];
-
-  for (const tagName of requiredTags) {
-    const pattern = new RegExp(`<${tagName}(?=[\\s>])`);
-    if (!pattern.test(text)) {
-      addIssue(result, {
-        severity: "error",
-        code: "packets.missing-template-section",
-        file: relativePath,
-        message: `Operational packet reference is missing <${tagName}>.`,
-      });
-    }
-  }
-}
-
-function lintAutonomousReadiness(
-  result: LintResult,
-  root: string,
-  docs: Record<string, string | null>,
-  operationalPackets: string | null,
-  ignoredDirs: string[],
-) {
-  const isLikelyTestPath = (relativePath: string) => /(^|\/)(__tests__|tests)(\/|$)|(^|\/)(test_[^/]+|[^/]+\.(test|spec)\.[^.]+)$/.test(relativePath);
-  const looksLikeEvidenceEmission = (line: string) => /(console\.|logger\.|tracer\.|trace\(|emit\(|\.(info|warn|error|debug|trace)\s*\()/.test(line);
-  const parseMarkerBlockName = (marker: string) => {
-    const match = marker.match(/\[([^\]]+)\]\s*$/);
-    if (!match) {
-      return undefined;
-    }
-
-    return match[1].startsWith("BLOCK_") ? match[1].slice("BLOCK_".length) : undefined;
-  };
-  const lineHasRuntimeMarker = (text: string, marker: string) =>
-    text
-      .split("\n")
-      .some((line) => line.includes(marker) && !/^\s*(\/\/|#|--|;+|\*)/.test(line) && looksLikeEvidenceEmission(line));
-
-  if (!operationalPackets) {
-    addAutonomyIssue(
-      result,
-      "error",
-      "autonomy.missing-operational-packets",
-      OPTIONAL_PACKET_DOC,
-      "Autonomous execution requires docs/operational-packets.xml so controller, worker, and failure handoffs have a shared packet shape.",
-    );
-  } else {
-    const packetRequirements = [
-      {
-        pattern: /<CheckpointReportTemplate(?=[\s>])/, code: "autonomy.packets-missing-checkpoint-template",
-        message: "Autonomous execution packets should include a CheckpointReportTemplate for visible step handoff.",
-      },
-      {
-        pattern: /<assumptions(?=[\s>])/, code: "autonomy.packets-missing-assumptions",
-        message: "Execution packets should record assumptions so future agents know what was accepted as stable context.",
-      },
-      {
-        pattern: /<stop-conditions(?=[\s>])/, code: "autonomy.packets-missing-stop-conditions",
-        message: "Execution packets should define stop-conditions so long runs halt instead of drifting silently.",
-      },
-      {
-        pattern: /<retry-budget(?=[\s>])/, code: "autonomy.packets-missing-retry-budget",
-        message: "Execution packets should define a retry-budget for bounded fix loops.",
-      },
-      {
-        pattern: /<checkpoint-fields(?=[\s>])/, code: "autonomy.packets-missing-checkpoint-fields",
-        message: "Execution packets should define checkpoint-fields for assumptions, commands, evidence, and next action.",
-      },
-    ];
-
-    for (const requirement of packetRequirements) {
-      if (!requirement.pattern.test(operationalPackets)) {
-        addAutonomyIssue(result, "error", requirement.code, OPTIONAL_PACKET_DOC, requirement.message);
-      }
-    }
-  }
-
-  if (!docs["docs/technology.xml"]) {
-    addAutonomyIssue(
-      result,
-      "error",
-      "autonomy.missing-technology-artifact",
-      "docs/technology.xml",
-      "Autonomous execution should be anchored to docs/technology.xml so the preferred stack and autonomy policy are explicit.",
-    );
-  } else {
-    const technologyDoc = docs["docs/technology.xml"];
-    if (!/<PreferredAgentStack(?=[\s>])/.test(technologyDoc)) {
-      addAutonomyIssue(
-        result,
-        "warning",
-        "autonomy.technology-missing-preferred-agent-stack",
-        "docs/technology.xml",
-        "Technology guidance should include PreferredAgentStack so workers know which runtime, test, and observability surfaces are preferred.",
-      );
-    }
-
-    if (!/<AutonomyPolicy(?=[\s>])/.test(technologyDoc)) {
-      addAutonomyIssue(
-        result,
-        "warning",
-        "autonomy.technology-missing-autonomy-policy",
-        "docs/technology.xml",
-        "Technology guidance should include AutonomyPolicy so retry budgets and replan triggers are explicit.",
-      );
-    }
-  }
-
-  if (!docs["docs/knowledge-graph.xml"] || !docs["docs/development-plan.xml"] || !docs["docs/verification-plan.xml"]) {
-    return;
-  }
-
-  let index;
-  try {
-    index = loadGraceArtifactIndex(root);
-  } catch (error) {
-    addAutonomyIssue(
-      result,
-      "error",
-      "autonomy.failed-to-index-project",
-      root,
-      `Autonomous readiness checks could not index the GRACE project: ${error instanceof Error ? error.message : String(error)}`,
-    );
-    return;
-  }
-
-  const sharedModules = index.modules.filter((moduleRecord) => moduleRecord.plan || moduleRecord.graph);
-  const implementationFiles = collectCodeFiles(root, ignoredDirs)
-    .map((filePath) => ({
-      path: normalizeRelative(root, filePath),
-      text: readFileSync(filePath, "utf8"),
-    }))
-    .filter((file) => !isLikelyTestPath(file.path));
-
-  for (const moduleRecord of sharedModules) {
-    const moduleImplementationFiles = moduleRecord.localFiles.filter((file) => !isLikelyTestPath(file.path));
-    if (moduleRecord.verifications.length === 0) {
-      addAutonomyIssue(
-        result,
-        "error",
-        "autonomy.module-missing-verification",
-        "docs/verification-plan.xml",
-        `Module \`${moduleRecord.id}\` has shared planning or graph context but no matching verification entry. Autonomous runs require a V-M entry per shared module.`,
-      );
-    }
-
-    if (moduleImplementationFiles.length === 0) {
-      addAutonomyIssue(
-        result,
-        "error",
-        "autonomy.module-missing-implementation-files",
-        "docs/knowledge-graph.xml",
-        `Module \`${moduleRecord.id}\` has no linked non-test governed files. Autonomous execution needs a real implementation surface, not only tests or shared-doc declarations.`,
-      );
-    }
-
-    for (const step of moduleRecord.steps) {
-      if (!step.verificationId) {
-        addAutonomyIssue(
-          result,
-          "error",
-          "autonomy.step-missing-verification",
-          "docs/development-plan.xml",
-          `${step.phaseTag} / ${step.stepTag} for module \`${moduleRecord.id}\` is missing an explicit verification reference. Autonomous packets should name the verification gate they rely on.`,
-        );
-      }
-    }
-  }
-
-  for (const entry of index.verifications) {
-    if (entry.testFiles.length === 0) {
-      addAutonomyIssue(
-        result,
-        "error",
-        "autonomy.verification-missing-test-files",
-        "docs/verification-plan.xml",
-        `Verification entry \`${entry.id}\` must list at least one test file for autonomous execution.`,
-      );
-    }
-
-    if (entry.moduleChecks.length === 0) {
-      addAutonomyIssue(
-        result,
-        "error",
-        "autonomy.verification-missing-module-checks",
-        "docs/verification-plan.xml",
-        `Verification entry \`${entry.id}\` must define at least one module-local command for autonomous execution.`,
-      );
-    }
-
-    if (entry.scenarios.length === 0) {
-      addAutonomyIssue(
-        result,
-        "error",
-        "autonomy.verification-missing-scenarios",
-        "docs/verification-plan.xml",
-        `Verification entry \`${entry.id}\` must define success or failure scenarios before it can gate autonomous execution.`,
-      );
-    }
-
-    if (entry.requiredLogMarkers.length === 0 && entry.requiredTraceAssertions.length === 0) {
-      addAutonomyIssue(
-        result,
-        "error",
-        "autonomy.verification-missing-observable-evidence",
-        "docs/verification-plan.xml",
-        `Verification entry \`${entry.id}\` must define required log markers or trace assertions so failures are observable without hidden model reasoning.`,
-      );
-    }
-
-    for (const testFile of entry.testFiles) {
-      const absolutePath = path.isAbsolute(testFile) ? testFile : path.join(root, testFile);
-      if (!existsSync(absolutePath)) {
-        addAutonomyIssue(
-          result,
-          "error",
-          "autonomy.verification-test-file-missing-on-disk",
-          "docs/verification-plan.xml",
-          `Verification entry \`${entry.id}\` references test file \`${testFile}\`, but that file does not exist on disk.`,
-        );
-      }
-
-      const governedTestRecord = index.files.find((file) => file.path === testFile);
-      if (governedTestRecord && entry.moduleId && !governedTestRecord.linkedModuleIds.includes(entry.moduleId)) {
-        addAutonomyIssue(
-          result,
-          "error",
-          "autonomy.verification-test-file-unlinked-module",
-          "docs/verification-plan.xml",
-          `Verification entry \`${entry.id}\` references governed test file \`${testFile}\`, but that file is not linked to module \`${entry.moduleId}\`.`,
-        );
-      }
-
-      if (!entry.moduleChecks.some((check) => check.includes(testFile) || check.includes(path.dirname(testFile)))) {
-        addAutonomyIssue(
-          result,
-          "warning",
-          "autonomy.verification-module-check-does-not-reference-test-file",
-          "docs/verification-plan.xml",
-          `Verification entry \`${entry.id}\` does not have a module-check that clearly targets \`${testFile}\` or its containing directory.`,
-        );
-      }
-    }
-
-    for (const marker of entry.requiredLogMarkers) {
-      const scopedImplementationFiles = entry.moduleId
-        ? implementationFiles.filter((file) => {
-            const moduleRecord = index.modules.find((module) => module.id === entry.moduleId);
-            return moduleRecord?.localFiles.some((moduleFile) => moduleFile.path === file.path && !isLikelyTestPath(moduleFile.path));
-          })
-        : implementationFiles;
-
-      if (!scopedImplementationFiles.some((file) => lineHasRuntimeMarker(file.text, marker))) {
-        addAutonomyIssue(
-          result,
-          "error",
-          "autonomy.required-log-marker-not-found",
-          "docs/verification-plan.xml",
-          `Verification entry \`${entry.id}\` requires log marker \`${marker}\`, but that marker was not found in the current codebase.`,
-        );
-      }
-
-      const requiredBlock = parseMarkerBlockName(marker);
-      if (requiredBlock && entry.moduleId) {
-        const moduleRecord = index.modules.find((module) => module.id === entry.moduleId);
-        if (moduleRecord && !moduleRecord.localFiles.some((file) => !isLikelyTestPath(file.path) && file.blocks.some((block) => block.name === requiredBlock))) {
-          addAutonomyIssue(
-            result,
-            "error",
-            "autonomy.required-log-marker-block-not-found",
-            "docs/verification-plan.xml",
-            `Verification entry \`${entry.id}\` requires log marker \`${marker}\`, but no linked runtime file exposes BLOCK_${requiredBlock}.`,
-          );
-        }
-      }
-    }
-
-    if (!entry.waveFollowUp) {
-      addAutonomyIssue(
-        result,
-        "warning",
-        "autonomy.verification-missing-wave-follow-up",
-        "docs/verification-plan.xml",
-        `Verification entry \`${entry.id}\` does not define a wave-level follow-up check. Long autonomous runs are safer when merged surfaces have an explicit post-merge gate.`,
-      );
-    }
-
-    if (!entry.phaseFollowUp) {
-      addAutonomyIssue(
-        result,
-        "warning",
-        "autonomy.verification-missing-phase-follow-up",
-        "docs/verification-plan.xml",
-        `Verification entry \`${entry.id}\` does not define a phase-level follow-up check. Autonomous execution benefits from an explicit broader gate before phase completion.`,
-      );
-    }
-  }
-}
-
-function lintExportMapParity(
-  result: LintResult,
-  relativePath: string,
-  items: ModuleMapItem[],
-  analysis: LanguageAnalysis,
-  role: ModuleRole,
-  mapMode: MapMode,
-) {
-  if (mapMode !== "EXPORTS") {
-    return;
-  }
-
-  const exportSeverity = analysis.exportConfidence === "exact" ? "error" : "warning";
-
-  if (analysis.exportConfidence === "heuristic") {
-    addIssue(result, {
-      severity: "warning",
-      code: "analysis.heuristic-export-surface",
-      file: relativePath,
-      message: `The ${analysis.adapterId} adapter inferred exports heuristically for this file. Exact MODULE_MAP parity may require explicit file ROLE/MAP_MODE or stronger language-specific export declarations.`,
-    });
-  }
-
-  if (analysis.hasWildcardReExport) {
-    addIssue(result, {
-      severity: "warning",
-      code: "analysis.wildcard-reexport-surface",
-      file: relativePath,
-      message: "This file uses wildcard re-exports. Exact export parity is skipped unless you use a more specific MAP_MODE or explicit barrel structure.",
-    });
-    return;
-  }
-
-  const mappedSymbols = new Set(items.flatMap((item) => (item.symbolName ? [item.symbolName] : [])));
-  if (mappedSymbols.size === 0 && analysis.exports.size > 0) {
-    addIssue(result, {
-      severity: exportSeverity,
-      code: "markup.module-map-missing-symbol-entries",
-      file: relativePath,
-      message: "MODULE_MAP should list concrete symbol names when MAP_MODE resolves to EXPORTS.",
-    });
-    return;
-  }
-
-  for (const exportName of analysis.exports) {
-    if (!mappedSymbols.has(exportName)) {
-      addIssue(result, {
-        severity: exportSeverity,
-        code: "markup.module-map-missing-export",
-        file: relativePath,
-        message: `MODULE_MAP is missing the exported symbol \`${exportName}\`.`,
-      });
-    }
-  }
-
-  for (const item of items) {
-    if (!item.symbolName) {
-      continue;
-    }
-
-    if (!analysis.exports.has(item.symbolName)) {
-      addIssue(result, {
-        severity: role === "RUNTIME" || role === "TYPES" ? "warning" : "warning",
-        code: "markup.module-map-extra-export",
-        file: relativePath,
-        line: item.line,
-        message: `MODULE_MAP lists \`${item.symbolName}\`, but no matching export was found by the ${analysis.adapterId} adapter.`,
-      });
-    }
-  }
-}
-
-function lintGovernedFile(result: LintResult, root: string, filePath: string, text: string) {
-  const relativePath = normalizeRelative(root, filePath);
-  result.governedFiles += 1;
-
-  const moduleContractSection = ensureSectionPair(
-    result,
-    relativePath,
-    text,
-    "START_MODULE_CONTRACT",
-    "END_MODULE_CONTRACT",
-    "markup.missing-module-contract",
-    "Governed files must include a paired MODULE_CONTRACT section.",
-  );
-  const moduleMapSection = findSection(text, "START_MODULE_MAP", "END_MODULE_MAP");
-  const changeSummarySection = ensureSectionPair(
-    result,
-    relativePath,
-    text,
-    "START_CHANGE_SUMMARY",
-    "END_CHANGE_SUMMARY",
-    "markup.missing-change-summary",
-    "Governed files must include a paired CHANGE_SUMMARY section.",
-  );
-
-  lintScopedMarkers(
-    result,
-    relativePath,
-    text,
-    /START_CONTRACT:\s*([A-Za-z0-9_$.\-]+)/,
-    /END_CONTRACT:\s*([A-Za-z0-9_$.\-]+)/,
-    "contract",
-  );
-  lintScopedMarkers(
-    result,
-    relativePath,
-    text,
-    /START_BLOCK_([A-Za-z0-9_]+)/,
-    /END_BLOCK_([A-Za-z0-9_]+)/,
-    "block",
-  );
-
-  const contract = moduleContractSection ? parseModuleContract(moduleContractSection) : null;
-  const mapItems = moduleMapSection ? parseModuleMapItems(moduleMapSection) : [];
-  const adapter = getLanguageAdapter(filePath);
-  let analysis: LanguageAnalysis | null = null;
-  if (adapter) {
-    try {
-      analysis = adapter.analyze(filePath, text);
-    } catch (error) {
-      addIssue(result, {
-        severity: "warning",
-        code: "analysis.adapter-failed",
-        file: relativePath,
-        message: `${adapter.id} adapter failed: ${error instanceof Error ? error.message : String(error)}`,
-      });
-    }
-  }
-  const role = inferRole(contract, analysis);
-  const mapMode = inferMapMode(contract, role, mapItems, analysis);
-
-  if (moduleContractSection && contract) {
-    const missingContractFields = ["PURPOSE", "SCOPE", "DEPENDS", "LINKS"].filter((field) => !contract.fields[field]);
-    if (missingContractFields.length > 0) {
-      addIssue(result, {
-        severity: "error",
-        code: "markup.incomplete-module-contract",
-        file: relativePath,
-        message: `MODULE_CONTRACT should include PURPOSE, SCOPE, DEPENDS, and LINKS fields. Missing: ${missingContractFields.join(", ")}.`,
-      });
-    }
-  }
-
-  if (moduleContractSection && contract?.fields.ROLE && !contract.role) {
-    addIssue(result, {
-      severity: "error",
-      code: "markup.invalid-role",
-      file: relativePath,
-      message: `Unsupported ROLE \`${contract.fields.ROLE}\`. Use RUNTIME, TEST, BARREL, CONFIG, TYPES, or SCRIPT.`,
-    });
-  }
-
-  if (moduleContractSection && contract?.fields.MAP_MODE && !contract.mapMode) {
-    addIssue(result, {
-      severity: "error",
-      code: "markup.invalid-map-mode",
-      file: relativePath,
-      message: `Unsupported MAP_MODE \`${contract.fields.MAP_MODE}\`. Use EXPORTS, LOCALS, SUMMARY, or NONE.`,
-    });
-  }
-
-  if (!moduleMapSection && mapMode !== "NONE") {
-    addIssue(result, {
-      severity: "error",
-      code: "markup.missing-module-map",
-      file: relativePath,
-      message: `Governed files with ROLE ${role} and MAP_MODE ${mapMode} must include a paired MODULE_MAP section.`,
-    });
-  }
-
-  if (moduleMapSection && mapMode !== "NONE" && mapItems.length === 0) {
-    addIssue(result, {
-      severity: "error",
-      code: "markup.empty-module-map",
-      file: relativePath,
-      message: `MODULE_MAP must include at least one item when MAP_MODE resolves to ${mapMode}.`,
-    });
-  }
-
-  if (changeSummarySection && !/LAST_CHANGE:/s.test(changeSummarySection.content)) {
-    addIssue(result, {
-      severity: "error",
-      code: "markup.empty-change-summary",
-      file: relativePath,
-      message: "CHANGE_SUMMARY must contain at least one LAST_CHANGE entry.",
-    });
-  }
-
-  if (analysis) {
-    lintExportMapParity(result, relativePath, mapItems, analysis, role, mapMode);
-  }
-}
-
-export function lintGraceProject(projectRoot: string, options: LintOptions = {}): LintResult {
-  const root = path.resolve(projectRoot);
-  const { config, issues: configIssues } = loadGraceLintConfig(root);
-  const profile: LintProfile = options.profile ?? "standard";
-
-  const docs = {
-    "docs/technology.xml": readTextIfExists(path.join(root, "docs/technology.xml")),
-    "docs/knowledge-graph.xml": readTextIfExists(path.join(root, "docs/knowledge-graph.xml")),
-    "docs/development-plan.xml": readTextIfExists(path.join(root, "docs/development-plan.xml")),
-    "docs/verification-plan.xml": readTextIfExists(path.join(root, "docs/verification-plan.xml")),
-  } satisfies Record<string, string | null>;
-
-  const result: LintResult = {
-    schemaVersion: "1.0.0",
-    tool: "grace-lint",
-    generatedAt: new Date().toISOString(),
-    root,
-    profile,
-    filesChecked: 0,
-    governedFiles: 0,
-    xmlFilesChecked: 0,
-    issues: [...configIssues],
-    summary: {
-      issues: 0,
-      errors: 0,
-      warnings: 0,
-    },
-  };
-
-  if (configIssues.some((issue) => issue.severity === "error" && issue.file === LINT_CONFIG_FILE)) {
-    result.issues = result.issues.map((issue) => withLintIssueGuide(issue));
-    result.summary = {
-      issues: result.issues.length,
-      errors: result.issues.filter((issue) => issue.severity === "error").length,
-      warnings: result.issues.filter((issue) => issue.severity === "warning").length,
-    };
-    return result;
-  }
-
-  if (!options.allowMissingDocs) {
-    for (const relativePath of REQUIRED_DOCS) {
-      if (!docs[relativePath]) {
-        addIssue(result, {
-          severity: "error",
-          code: "docs.missing-required-artifact",
-          file: relativePath,
-          message: `Missing required current GRACE artifact \`${relativePath}\`.`,
-        });
-      }
-    }
-  }
-
-  for (const [relativePath, contents] of Object.entries(docs)) {
-    if (!contents) {
-      continue;
-    }
-
-    result.xmlFilesChecked += 1;
-    lintUniqueTags(result, relativePath, contents);
-  }
-
-  const operationalPackets = readTextIfExists(path.join(root, OPTIONAL_PACKET_DOC));
-  if (operationalPackets) {
-    result.xmlFilesChecked += 1;
-    lintRequiredPacketSections(result, OPTIONAL_PACKET_DOC, operationalPackets);
-  }
-
-  if (profile === "autonomous") {
-    lintAutonomousReadiness(result, root, docs, operationalPackets, config?.ignoredDirs ?? []);
-  }
-
-  const knowledgeGraph = docs["docs/knowledge-graph.xml"];
-  const developmentPlan = docs["docs/development-plan.xml"];
-  const verificationPlan = docs["docs/verification-plan.xml"];
-
-  const graphModuleIds = knowledgeGraph ? extractModuleIds(knowledgeGraph) : new Set<string>();
-  const planModuleIds = developmentPlan ? extractModuleIds(developmentPlan) : new Set<string>();
-  const verificationIds = verificationPlan ? extractVerificationIds(verificationPlan) : new Set<string>();
-
-  if (knowledgeGraph && verificationPlan) {
-    for (const ref of extractVerificationRefs(knowledgeGraph)) {
-      if (!verificationIds.has(ref.value)) {
-        addIssue(result, {
-          severity: "error",
-          code: "graph.missing-verification-entry",
-          file: "docs/knowledge-graph.xml",
-          line: ref.line,
-          message: `Knowledge graph references \`${ref.value}\`, but no matching verification entry exists.`,
-        });
-      }
-    }
-  }
-
-  if (developmentPlan && verificationPlan) {
-    for (const ref of extractVerificationRefs(developmentPlan)) {
-      if (!verificationIds.has(ref.value)) {
-        addIssue(result, {
-          severity: "error",
-          code: "plan.missing-verification-entry",
-          file: "docs/development-plan.xml",
-          line: ref.line,
-          message: `Development plan references \`${ref.value}\`, but no matching verification entry exists.`,
-        });
-      }
-    }
-
-    for (const step of extractStepRefs(developmentPlan)) {
-      if (step.moduleId && !planModuleIds.has(step.moduleId)) {
-        addIssue(result, {
-          severity: "error",
-          code: "plan.step-missing-module",
-          file: "docs/development-plan.xml",
-          line: step.line,
-          message: `${step.stepTag} references module \`${step.moduleId}\`, but no matching module tag exists in the plan.`,
-        });
-      }
-
-      if (step.verificationId && verificationPlan && !verificationIds.has(step.verificationId)) {
-        addIssue(result, {
-          severity: "error",
-          code: "plan.step-missing-verification",
-          file: "docs/development-plan.xml",
-          line: step.line,
-          message: `${step.stepTag} references verification entry \`${step.verificationId}\`, but no matching tag exists in verification-plan.xml.`,
-        });
-      }
-    }
-  }
-
-  if (knowledgeGraph && developmentPlan) {
-    for (const moduleId of graphModuleIds) {
-      if (!planModuleIds.has(moduleId)) {
-        addIssue(result, {
-          severity: "error",
-          code: "graph.module-missing-from-plan",
-          file: "docs/knowledge-graph.xml",
-          message: `Module \`${moduleId}\` exists in the knowledge graph but not in the development plan.`,
-        });
-      }
-    }
-
-    for (const moduleId of planModuleIds) {
-      if (!graphModuleIds.has(moduleId)) {
-        addIssue(result, {
-          severity: "error",
-          code: "plan.module-missing-from-graph",
-          file: "docs/development-plan.xml",
-          message: `Module \`${moduleId}\` exists in the development plan but not in the knowledge graph.`,
-        });
-      }
-    }
-  }
-
-  for (const filePath of collectCodeFiles(root, config?.ignoredDirs ?? [])) {
-    result.filesChecked += 1;
-    const text = readFileSync(filePath, "utf8");
-    if (!hasGraceMarkers(text)) {
-      continue;
-    }
-
-    lintGovernedFile(result, root, filePath, text);
-  }
-
-  result.issues = result.issues.map((issue) => withLintIssueGuide(issue));
+function finalizeResult(result: LintResult): LintResult {
+  result.issues.sort((left, right) => left.file.localeCompare(right.file) || (left.line ?? 0) - (right.line ?? 0) || left.code.localeCompare(right.code));
   result.summary = {
     issues: result.issues.length,
     errors: result.issues.filter((issue) => issue.severity === "error").length,
     warnings: result.issues.filter((issue) => issue.severity === "warning").length,
   };
-
+  result.issues = result.issues.map(withLintIssueGuide);
   return result;
 }
 
+function reportUnreadableDirectory(result: LintResult): UnreadableDirectoryHandler {
+  return (directory, error) => {
+    addIssue(result, {
+      severity: "warning",
+      code: "walk.unreadable-directory",
+      file: directory,
+      message: describeUnreadableDirectory(directory, error),
+    });
+  };
+}
+
+function validateGovernedFiles(result: LintResult, root: string): void {
+  const { config, issues } = loadGraceLintConfig(root);
+  for (const configIssue of issues) {
+    addIssue(result, configIssue);
+  }
+  if (issues.some((issue) => issue.severity === "error")) {
+    return;
+  }
+
+  const files = collectCodeFiles(root, [".grace", ...(config?.ignoredDirs ?? [])], root, reportUnreadableDirectory(result));
+  result.filesChecked = files.length;
+  for (const file of files) {
+    const text = readText(file);
+    if (!hasGraceMarkers(text)) {
+      continue;
+    }
+    result.governedFiles += 1;
+    for (const issue of analyzeGovernedFile(root, file, text).issues) {
+      addIssue(result, issue);
+    }
+  }
+}
+
+function readText(file: string) {
+  return readFileSync(file, "utf8");
+}
+
+function listPlanFiles(directory: string, onUnreadableDirectory?: UnreadableDirectoryHandler): string[] {
+  if (!existsSync(directory)) {
+    return [];
+  }
+  let entries: Dirent[];
+  try {
+    entries = readdirSync(directory, { withFileTypes: true });
+  } catch (error) {
+    onUnreadableDirectory?.(directory, error);
+    return [];
+  }
+  return entries.flatMap((entry) => {
+    const entryPath = path.join(directory, entry.name);
+    if (entry.isDirectory()) {
+      return listPlanFiles(entryPath, onUnreadableDirectory);
+    }
+    return entry.isFile() && entry.name === "plan.xml" ? [entryPath] : [];
+  });
+}
+
+function readPlanStatus(planFile: string): string | null {
+  const artifact = readGraceXmlArtifact(planFile);
+  return artifact.root?.tag === "GraceChangePlan" ? artifact.root.attributes.status ?? null : null;
+}
+
+/** One assertion section selected for extraction and (conditionally) semantic evaluation. */
+type SectionJob = {
+  planFile: string;
+  section: "BaselineAssertions" | "TargetAssertions";
+  extraction: AssertionExtractionResult;
+  evaluateSemantically: boolean;
+  includeExtractionIssues: boolean;
+  skipUnevaluatedCommands: boolean;
+  /** Shared extraction-diagnostic policy: `archive` drops current-phase errors and advisory noise. */
+  lifecycle: AssertionLifecycle;
+};
+
+async function validateAssertions(
+  result: LintResult,
+  paths: Grace4ProjectPaths,
+  planFilesActive: string[],
+  planFilesArchived: string[],
+  graph: GraphProjection,
+  verification: VerificationProjection,
+  root: string,
+  options: LintOptions,
+) {
+  const runCommands = options.runCommands ?? false;
+  const assertionMode = options.assertionMode ?? "current";
+  const selectedPlan = assertionMode === "current" ? null : resolveSelectedApprovedPlan(result, paths, options.changeId);
+
+  const jobs: SectionJob[] = [];
+  const pushJob = (
+    planFile: string,
+    section: "BaselineAssertions" | "TargetAssertions",
+    evaluateSemantically: boolean,
+    lifecycle: AssertionLifecycle,
+    includeExtractionIssues = true,
+    skipUnevaluatedCommands = false,
+  ) => {
+    jobs.push({
+      planFile,
+      section,
+      extraction: extractAssertionsWithIssues(planFile, section),
+      evaluateSemantically,
+      includeExtractionIssues,
+      skipUnevaluatedCommands,
+      lifecycle,
+    });
+  };
+
+  for (const planFile of planFilesActive) {
+    const status = readPlanStatus(planFile);
+    const isSelected = selectedPlan !== null && path.resolve(selectedPlan) === path.resolve(planFile);
+    const evaluateCurrentBaseline = assertionMode === "current" && status === "approved";
+    const evaluateUnrelatedFinalBaseline = assertionMode === "final" && status === "approved" && !isSelected;
+    pushJob(planFile, "BaselineAssertions", evaluateCurrentBaseline || evaluateUnrelatedFinalBaseline, "active", true, true);
+    pushJob(planFile, "TargetAssertions", false, "active");
+  }
+
+  for (const planFile of planFilesArchived) {
+    // Archived plans: syntax only, never semantic (baseline may be stale, target may be superseded by later changes)
+    pushJob(planFile, "BaselineAssertions", false, "archive");
+    pushJob(planFile, "TargetAssertions", false, "archive");
+  }
+
+  if (assertionMode !== "current" && selectedPlan) {
+    pushJob(
+      selectedPlan,
+      assertionMode === "baseline" ? "BaselineAssertions" : "TargetAssertions",
+      true,
+      "active",
+      false,
+    );
+  }
+
+  let commandResults: Map<string, CommandRunResult[]> | undefined;
+  if (runCommands) {
+    const declared = collectDeclaredCommands(jobs);
+    if (declared.length > 0) {
+      const summary = await runDeclaredCommands(declared, {
+        root,
+        changeId: options.changeId,
+        assertionMode,
+        timeoutMs: options.commandTimeoutMs ?? DEFAULT_COMMAND_TIMEOUT_MS,
+        verbosity: options.commandVerbosity ?? "compact",
+        progress: options.commandProgress,
+        logRoot: options.commandLogRoot,
+        // Config issues are already reported by validateGovernedFiles; an invalid value
+        // falls back to the default rather than failing the run a second time.
+        runLogRetention: resolveRunLogRetention(options.runLogRetention, loadGraceLintConfig(root).config),
+      }, options.commandSignal);
+      result.commands = summary.commands.map(toCommandEvidence);
+      commandResults = new Map();
+      for (const command of summary.commands) {
+        const bucket = commandResults.get(command.assertionKey) ?? [];
+        bucket.push(command);
+        commandResults.set(command.assertionKey, bucket);
+      }
+    }
+  }
+
+  const context: AssertionContext = { root, graph, verification, runCommands, commandResults };
+  for (const job of jobs) {
+    evaluateJob(result, job, context);
+  }
+}
+
+/** One DeclaredCommand per Command value of every semantically evaluated MustPassCommand. */
+function collectDeclaredCommands(jobs: SectionJob[]): DeclaredCommand[] {
+  return jobs
+    .filter((job) => job.evaluateSemantically)
+    .flatMap((job) =>
+      job.extraction.assertions.flatMap((assertion) => {
+        const slotKey = assertion.slotKey;
+        if (assertion.kind !== "MustPassCommand" || !slotKey) {
+          return [];
+        }
+        const slotIndex = Number(slotKey.split("::").pop());
+        return assertion.values.map((command, commandIndex) => {
+          // A declared budgetSeconds becomes this command's timeout; absent, the runner-wide
+          // --command-timeout still applies. 0 is a real value (disable) and must survive.
+          const budgetSeconds = assertion.commandBudgetsSeconds?.[commandIndex];
+          return {
+            assertionKey: slotKey,
+            assertionId: `${path.basename(job.planFile)}#${Number.isNaN(slotIndex) ? "?" : slotIndex + 1}`,
+            command,
+            ...(budgetSeconds == null ? {} : { timeoutMs: budgetSeconds * 1000 }),
+          };
+        });
+      }),
+    );
+}
+
+function toCommandEvidence(command: CommandRunResult): CommandEvidence {
+  return {
+    index: command.index,
+    command: command.command,
+    exitCode: command.exitCode,
+    durationMs: command.durationMs,
+    timedOut: command.timedOut,
+    skipped: command.skipped,
+    logFile: command.logFile,
+  };
+}
+
+function evaluateJob(
+  result: LintResult,
+  job: SectionJob,
+  context: AssertionContext,
+) {
+  if (job.includeExtractionIssues) {
+    for (const issue of filterAssertionIssuesForLifecycle(job.extraction.issues, job.lifecycle)) {
+      addGrace4Issue(result, issue);
+    }
+  }
+  if (job.evaluateSemantically) {
+    for (const assertion of job.extraction.assertions) {
+      if (job.skipUnevaluatedCommands && assertion.kind === "MustPassCommand" && !context.runCommands) {
+        continue;
+      }
+      for (const issue of evaluateAssertion(assertion, context)) {
+        addGrace4Issue(result, issue);
+      }
+    }
+  }
+}
+
+function resolveSelectedApprovedPlan(
+  result: LintResult,
+  paths: Grace4ProjectPaths,
+  changeId: string | undefined,
+): string | null {
+  if (!changeId) {
+    addIssue(result, {
+      severity: "error",
+      code: "assertion.change-required",
+      file: paths.changesActiveDir,
+      message: "Selected baseline or target assertion evaluation requires one --change C-* identifier.",
+    });
+    return null;
+  }
+  if (!ANCHOR_PATTERNS.change.test(changeId)) {
+    addIssue(result, {
+      severity: "error",
+      code: "assertion.invalid-change-id",
+      file: paths.changesActiveDir,
+      message: `Selected change '${changeId}' must be a canonical C-* identifier.`,
+    });
+    return null;
+  }
+
+  const bundleDir = path.join(paths.changesActiveDir, changeId);
+  const specFile = path.join(bundleDir, "spec.xml");
+  const planFile = path.join(bundleDir, "plan.xml");
+  const spec = readGraceXmlArtifact(specFile);
+  const plan = readGraceXmlArtifact(planFile);
+  const specWrapper = spec.root?.children.filter((child) => ANCHOR_PATTERNS.change.test(child.tag));
+  const planWrapper = plan.root?.children.filter((child) => ANCHOR_PATTERNS.change.test(child.tag));
+  const approved = spec.root?.tag === "GraceChangeSpec"
+    && spec.root.attributes.status === "approved"
+    && specWrapper?.length === 1
+    && specWrapper[0]?.tag === changeId
+    && plan.root?.tag === "GraceChangePlan"
+    && plan.root.attributes.status === "approved"
+    && planWrapper?.length === 1
+    && planWrapper[0]?.tag === changeId;
+
+  if (!approved) {
+    addIssue(result, {
+      severity: "error",
+      code: "assertion.change-not-approved",
+      file: bundleDir,
+      message: `Selected change ${changeId} must name one active bundle whose spec.xml and plan.xml are both approved and identity-matched.`,
+    });
+    return null;
+  }
+  return planFile;
+}
+/** Lints the current GRACE 4 .grace document state and file-local semantic markup. */
+export async function lintGraceProject(projectRoot: string, options: LintOptions = {}): Promise<LintResult> {
+  const root = path.resolve(projectRoot);
+  const profile = options.profile ?? "standard";
+  const result = createResult(root, profile, options);
+  const kind = detectGraceProjectKind(root);
+
+  if (kind === "grace3") {
+    addIssue(result, {
+      severity: "error",
+      code: "project.grace3-detected",
+      file: root,
+      message: formatGrace3MigrationGuidance(root),
+    });
+    return finalizeResult(result);
+  }
+
+  if (kind === "none") {
+    addIssue(result, {
+      severity: "error",
+      code: "project.missing-grace",
+      file: root,
+      message: "No .grace directory found.",
+    });
+    return finalizeResult(result);
+  }
+
+  validateGovernedFiles(result, root);
+
+  const paths = resolveGrace4Paths(root);
+  const validation = validateGrace4Project(root);
+  result.xmlFilesChecked = validation.artifacts.length;
+  for (const issue of validation.issues) {
+    addGrace4Issue(result, issue);
+  }
+
+  const graph = buildGraphProjection(paths);
+  const verification = buildVerificationProjection(paths, graph);
+  for (const issue of [...graph.issues, ...verification.issues]) {
+    addGrace4Issue(result, issue);
+  }
+
+  const activeScopes = collectActiveChangeScopes(paths);
+  const ownership = createDurableOwnershipIndex(graph, verification);
+  const scopeIssues = activeScopes.flatMap((scope) => scope.issues);
+  const overlapIssues = detectScopeOverlaps(activeScopes, ownership);
+  const parallelIssues = options.parallelPreflight ? detectUnsafeConcurrentExecution(activeScopes, ownership) : [];
+  for (const issue of [...scopeIssues, ...overlapIssues, ...parallelIssues]) {
+    addGrace4Issue(result, issue);
+  }
+
+  const unreadableDirectory = reportUnreadableDirectory(result);
+  const planFilesActive = [...listPlanFiles(paths.changesActiveDir, unreadableDirectory)];
+  const planFilesArchived = [...listPlanFiles(paths.changesArchiveDir, unreadableDirectory)];
+  await validateAssertions(result, paths, planFilesActive, planFilesArchived, graph, verification, root, options);
+
+  return finalizeResult(result);
+}
+
+export function isValidTextFormat(format: string) {
+  return TEXT_FORMAT_OPTIONS.has(format);
+}
+
 export function formatTextReport(result: LintResult, options: { remediate?: boolean } = {}) {
-  const errors = result.issues.filter((issue) => issue.severity === "error");
-  const warnings = result.issues.filter((issue) => issue.severity === "warning");
   const lines = [
     "GRACE Lint Report",
     "=================",
     `Root: ${result.root}`,
     `Profile: ${result.profile}`,
-    `Code files checked: ${result.filesChecked}`,
-    `Governed files checked: ${result.governedFiles}`,
-    `XML files checked: ${result.xmlFilesChecked}`,
-    `Issues: ${result.summary.issues} (errors: ${result.summary.errors}, warnings: ${result.summary.warnings})`,
+    `Files checked: ${result.filesChecked}`,
+    `Governed files: ${result.governedFiles}`,
+    `XML artifacts checked: ${result.xmlFilesChecked}`,
   ];
 
-  if (errors.length > 0) {
-    lines.push("", "Errors:");
-    for (const issue of errors) {
-      lines.push(`- [${issue.code}] ${issue.file}${issue.line ? `:${issue.line}` : ""} ${issue.message}`);
-      if (options.remediate) {
-        lines.push(`  Explanation: ${issue.explanation ?? "n/a"}`);
-        for (const step of issue.remediation ?? []) {
-          lines.push(`  Fix: ${step}`);
-        }
-      }
+  if (result.commands?.length) {
+    lines.push("Commands");
+    const total = result.commands.length;
+    for (const command of result.commands) {
+      const mark = command.skipped ? "-" : command.exitCode === 0 ? "✔" : "✖";
+      const detail = command.skipped
+        ? "skipped"
+        : command.timedOut
+          ? `timed out after ${formatDuration(command.durationMs)}`
+          : command.exitCode === 0
+            ? formatDuration(command.durationMs)
+            : `${formatDuration(command.durationMs)}, exit ${command.exitCode}`;
+      lines.push(`  ${mark} [${command.index}/${total}] ${command.command} (${detail})`);
+    }
+    const firstLog = result.commands.find((command) => command.logFile)?.logFile;
+    if (firstLog) {
+      lines.push(`  Logs: ${path.dirname(firstLog)}`);
     }
   }
 
-  if (warnings.length > 0) {
-    lines.push("", "Warnings:");
-    for (const issue of warnings) {
-      lines.push(`- [${issue.code}] ${issue.file}${issue.line ? `:${issue.line}` : ""} ${issue.message}`);
-      if (options.remediate) {
-        lines.push(`  Explanation: ${issue.explanation ?? "n/a"}`);
-        for (const step of issue.remediation ?? []) {
-          lines.push(`  Fix: ${step}`);
-        }
-      }
-    }
-  }
+  lines.push(`Errors: ${result.summary.errors}`, `Warnings: ${result.summary.warnings}`);
 
   if (result.issues.length === 0) {
-    lines.push("", "No GRACE integrity issues found.");
+    lines.push("", "No issues found.");
+    return lines.join("\n");
+  }
+
+  lines.push("", "Issues");
+  for (const issue of result.issues) {
+    const location = issue.line ? `${issue.file}:${issue.line}` : issue.file;
+    lines.push(`- [${issue.severity}] ${issue.code} ${location} — ${issue.message}`);
+    if (options.remediate && issue.remediation) {
+      lines.push(...issue.remediation.map((item) => `  • ${item}`));
+    }
   }
 
   return lines.join("\n");
-}
-
-export function isValidTextFormat(format: string) {
-  return TEXT_FORMAT_OPTIONS.has(format);
 }

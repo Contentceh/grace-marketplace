@@ -21,106 +21,103 @@ const EXACT_GUIDES: Record<string, Omit<LintIssueGuide, "code">> = {
   "config.unknown-key": {
     title: "Unknown Lint Config Key",
     explanation: ".grace-lint.json contains a key the CLI does not understand.",
-    remediation: ["Remove unsupported keys from .grace-lint.json.", "Use only documented keys such as ignoredDirs."],
+    remediation: ["Remove unsupported keys from .grace-lint.json.", "Use only documented keys such as ignoredDirs and runLogRetention."],
   },
-  "docs.missing-required-artifact": {
-    title: "Missing Required GRACE Artifact",
-    explanation: "A current GRACE project needs the required shared XML artifacts before the CLI can reason over architecture and verification.",
-    remediation: ["Create the missing artifact via $grace-init, $grace-plan, or $grace-verification.", "Use --allow-missing-docs only for partial repositories that are not yet full GRACE projects."],
-  },
-  "packets.missing-template-section": {
-    title: "Incomplete Operational Packets Template",
-    explanation: "docs/operational-packets.xml is missing one of the canonical packet template sections.",
-    remediation: ["Refresh docs/operational-packets.xml from the current grace-init template.", "Restore the missing template section instead of inventing a custom packet shape."],
+  "config.invalid-run-log-retention": {
+    title: "Invalid Run Log Retention",
+    explanation: "`runLogRetention` in .grace-lint.json sets how many non-passing --run-commands log directories to keep, so it must be a non-negative integer.",
+    remediation: ["Set runLogRetention to a non-negative integer, for example 25.", "Remove the key to use the default of 10."],
   },
   "analysis.adapter-failed": {
     title: "Language Adapter Failed",
-    explanation: "The file-level export analysis adapter threw an error, so lint fell back to structural checks only.",
+    explanation: "The file-level export analysis adapter failed, so exact export/local parity could not be validated for this governed file.",
     remediation: ["Inspect the file for unusual syntax or unsupported language features.", "Simplify the export surface or improve the adapter if this language pattern should be supported."],
   },
-  "autonomy.missing-operational-packets": {
-    title: "Missing Operational Packets Artifact",
-    explanation: "Long autonomous execution requires a shared packet contract so workers, reviewers, and fix loops can hand off state safely.",
-    remediation: ["Add docs/operational-packets.xml using the current grace-init template.", "Define execution packets, deltas, failure packets, and checkpoint reports before autonomous runs."],
+  "analysis.runtime-missing": {
+    title: "Language Runtime Missing",
+    explanation: "The governed file uses a language adapter that requires its language runtime on PATH. GRACE fails closed instead of silently dropping export/local parity checks.",
+    remediation: ["Install the runtime named in the issue message and ensure it is available on PATH.", "If the file should not be governed in this environment, exclude it explicitly rather than relying on incomplete analysis."],
   },
-  "autonomy.missing-technology-artifact": {
-    title: "Missing Technology Artifact",
-    explanation: "Autonomous execution should be anchored to an explicit project stack and execution policy, not inferred ad hoc.",
-    remediation: ["Add docs/technology.xml to define runtime, tooling, and project constraints.", "Name the preferred stack before asking agents to execute long trajectories."],
+  "walk.unreadable-directory": {
+    title: "Unreadable Directory Skipped",
+    explanation: "A directory could not be listed while walking the project, so the files inside it were not checked. This usually means restrictive permissions or a leftover sandbox directory; it does not make the GRACE project itself invalid.",
+    remediation: ["Restore read permission on the directory if it should be governed.", "If the directory is build output or a sandbox leftover, add it to ignoredDirs in .grace-lint.json or remove it."],
   },
-  "autonomy.packets-missing-checkpoint-template": {
-    title: "Missing Checkpoint Packet Template",
-    explanation: "Autonomous runs should leave behind a canonical checkpoint report so failures and handoffs stay observable.",
-    remediation: ["Add CheckpointReportTemplate to docs/operational-packets.xml.", "Refresh the packets artifact from the latest grace-init template if needed."],
+  "scope.durable-overlap": {
+    title: "Durable Scope Overlap",
+    explanation: "Two or more active change scopes claim overlapping durable regions, which creates a data-contention risk if executed in parallel.",
+    remediation: ["Review the overlapping durable scopes and decide whether they must be sequential or whether the overlap is acceptable.", "Treat durable overlap as a planning warning, not a blocker."],
   },
-  "autonomy.module-missing-verification": {
-    title: "Module Missing Verification Entry",
-    explanation: "Each shared module needs a matching V-M entry before autonomous execution can treat it as governed and observable.",
-    remediation: ["Add a V-M entry for the module in docs/verification-plan.xml.", "Run $grace-verification for the affected module or phase."],
+  "scope.observed-write-overlap": {
+    title: "Observed Write Overlap",
+    explanation: "Two or more active change scopes write to overlapping regions, which can cause unsafe concurrent execution.",
+    remediation: ["Do not run overlapping observed writes in parallel-safe mode.", "Sequence the changes or split scopes to eliminate the overlap."],
   },
-  "autonomy.module-missing-implementation-files": {
-    title: "Module Missing Implementation Files",
-    explanation: "A module cannot be autonomy-ready if it has no linked non-test governed runtime files.",
-    remediation: ["Implement the module via $grace-execute or $grace-multiagent-execute.", "Link the runtime file to the module through LINKS in MODULE_CONTRACT."],
+  "change.superseded-missing-replacement": {
+    title: "Superseded Change Missing Replacement Reference",
+    explanation: "A GraceChangeSpec or GraceChangePlan with status='superseded' should name the replacement C-* anchor via a <Replacement> or <ReplacementChange> child tag.",
+    remediation: ["Add a <Replacement>C-REPLACEMENT-ID</Replacement> child to the superseded wrapper.", "Or add a direct <C-REPLACEMENT-ID /> child tag as the replacement reference."],
   },
-  "autonomy.step-missing-verification": {
-    title: "Plan Step Missing Verification Ref",
-    explanation: "Execution steps should name the verification gate they depend on so agents do not improvise success criteria.",
-    remediation: ["Add verification=\"V-M-...\" to the step in docs/development-plan.xml.", "Make sure the referenced V-M entry exists in docs/verification-plan.xml."],
+  "assertion.command-subsumed": {
+    title: "Subsumed Assertion Command",
+    explanation: "Two MustPassCommand entries in the same assertion section run overlapping work: they share the same command head, and one command's path arguments are a component-wise prefix of the other's (or the wider command names no path at all and therefore covers the whole suite). The narrower command is re-run for nothing, which inflates gate wall-clock time without adding evidence. A bare token counts as a path argument only when it contains a separator or exists under the project root, so `bun test src` covers `bun test src/grace4` but never `bun test srcfoo`.",
+    remediation: ["Delete the narrower command and keep the whole-suite one, or narrow the wider command so the two cover disjoint paths.", "If the slow whole-suite command is dominated by substrate startup, move it to an acceptance tier instead of the gate."],
   },
-  "autonomy.verification-missing-test-files": {
-    title: "Verification Missing Test Files",
-    explanation: "A verification entry without test files is not actionable for worker loops or CI.",
-    remediation: ["Add one or more test-files entries to the V-M record.", "Point them at real module-local or module-owned tests."],
+  "assertion.invalid-command-budget": {
+    title: "Invalid Assertion Command Budget",
+    explanation: "A MustPassCommand/Command declares a budgetSeconds attribute that is not a non-negative integer number of seconds. The grammar mirrors --command-timeout exactly, including 0 meaning 'no timeout for this command'.",
+    remediation: ["Write budgetSeconds as a whole number of seconds, for example budgetSeconds=\"900\".", "Use budgetSeconds=\"0\" only when the command must never be killed on time, and omit the attribute to fall back to --command-timeout."],
   },
-  "autonomy.verification-missing-module-checks": {
-    title: "Verification Missing Module Checks",
-    explanation: "A V-M entry needs executable commands so workers and CI can run the intended checks directly.",
-    remediation: ["Add module-checks commands to the V-M entry.", "Prefer narrow module-local commands over whole-repo commands for worker loops."],
-  },
-  "autonomy.verification-missing-scenarios": {
-    title: "Verification Missing Scenarios",
-    explanation: "Autonomous execution needs named success and failure behavior, not only file paths or commands.",
-    remediation: ["Add success and failure scenarios to the V-M entry.", "Describe what observable behavior proves the module is correct."],
-  },
-  "autonomy.verification-missing-observable-evidence": {
-    title: "Verification Missing Observable Evidence",
-    explanation: "A V-M entry should require log markers or trace assertions so failures can be debugged without hidden reasoning.",
-    remediation: ["Add required-log-markers or required-trace-assertions to the V-M entry.", "Keep markers stable and map them back to semantic blocks."],
-  },
-  "autonomy.verification-test-file-missing-on-disk": {
-    title: "Verification References Missing Test File",
-    explanation: "The verification plan references a test file that does not currently exist on disk.",
-    remediation: ["Create the test file or update the V-M entry to the real path.", "Keep docs/verification-plan.xml synchronized with the codebase."],
-  },
-  "autonomy.verification-test-file-unlinked-module": {
-    title: "Verification Test File Not Linked To Module",
-    explanation: "A governed test file should belong to the same module it verifies so agents can navigate ownership precisely.",
-    remediation: ["Add the module ID to LINKS in the test file MODULE_CONTRACT.", "Or update the V-M entry to point at a test file that belongs to the module."],
-  },
-  "autonomy.verification-module-check-does-not-reference-test-file": {
-    title: "Module Check Does Not Reference Test File",
-    explanation: "The verification commands do not clearly mention the declared test file or its containing directory.",
-    remediation: ["Make at least one module-check reference the test file path or its directory.", "Keep the commands and declared test-files aligned."],
-  },
-  "autonomy.required-log-marker-not-found": {
-    title: "Required Log Marker Not Found",
-    explanation: "The verification plan requires a runtime marker that does not appear in linked implementation code.",
-    remediation: ["Emit the marker from the runtime implementation.", "Or update the V-M entry so the required marker matches the real runtime evidence."],
-  },
-  "autonomy.required-log-marker-block-not-found": {
-    title: "Required Marker Does Not Map To Semantic Block",
-    explanation: "The required log marker names a BLOCK_* suffix that does not exist in the linked runtime files.",
-    remediation: ["Add the matching BLOCK_* anchor to the implementation.", "Or update the marker in docs/verification-plan.xml to the correct block name."],
-  },
-  "autonomy.failed-to-index-project": {
-    title: "Autonomy Gate Could Not Index Project",
-    explanation: "The autonomy profile could not build a coherent GRACE artifact index from the project.",
-    remediation: ["Fix malformed or missing GRACE artifacts first.", "Run grace lint without the autonomous profile to resolve structural issues before retrying."],
+  "assertion.phase-incompatible-command": {
+    title: "Phase-Incompatible Assertion Command",
+    explanation: "A target command assertion invokes current-mode lifecycle lint. Current mode evaluates active approved baselines, so it is a pre-implementation check and cannot serve as target or final evidence after writes begin.",
+    remediation: ["Keep MustPassCommand entries as leaf project evidence such as tests, typecheck, build, format, or package checks.", "Run selected target or final GRACE lint as the outer execution gate instead of nesting it inside the plan."],
   },
 };
 
 const PREFIX_GUIDES: Array<{ prefix: string; title: string; explanation: string; remediation: string[] }> = [
+  {
+    prefix: "project.",
+    title: "GRACE 4 Project Detection Issue",
+    explanation: "The CLI could not identify a valid GRACE 4 .grace project state, or it detected legacy GRACE 3 artifacts instead.",
+    remediation: ["Run $grace-init for a new GRACE 4 project or $grace-migrate for legacy GRACE 3 projects.", "Do not rely on dual-mode docs/*.xml validation."],
+  },
+  {
+    prefix: "artifact.",
+    title: "GRACE 4 Artifact Grammar Issue",
+    explanation: "A .grace XML artifact violates the GRACE 4 root, metadata, version, or semantic-anchor grammar.",
+    remediation: ["Use approved GRACE 4 root tags with graceVersion=\"4.0\".", "Keep semantic anchors as XML tags, never attributes."],
+  },
+  {
+    prefix: "change.",
+    title: "GRACE 4 Change Lifecycle Issue",
+    explanation: "A change spec or plan has an invalid status, wrapper shape, or active/archive location for the GRACE 4 lifecycle.",
+    remediation: ["Keep draft and approved bundles under .grace/changes/active.", "Move applied, rejected, cancelled, or superseded bundles to archive with matching statuses."],
+  },
+  {
+    prefix: "context.",
+    title: "GRACE 4 Context Artifact Issue",
+    explanation: "A required .grace/context artifact is missing, has the wrong root, or has invalid applicability metadata.",
+    remediation: ["Create all five context artifacts from the GRACE 4 init template.", "If deployment or UX is not applicable, include a concrete reason."],
+  },
+  {
+    prefix: "projection.",
+    title: "GRACE 4 Projection Integrity Issue",
+    explanation: "Graph or verification index routes do not match the logical projection built from .grace documents.",
+    remediation: ["Synchronize GD-* and VD-* index ownership with document wrappers.", "Ensure every M-* has deterministic V-M-* coverage."],
+  },
+  {
+    prefix: "assertion.",
+    title: "GRACE 4 Assertion Failure",
+    explanation: "A BaselineAssertions or TargetAssertions entry failed against current graph, verification, or filesystem state.",
+    remediation: ["Reconcile the current state with the approved plan assertions.", "If the approved plan is stale, supersede and replan rather than editing it silently."],
+  },
+  {
+    prefix: "scope.",
+    title: "GRACE 4 Scope Conflict",
+    explanation: "Active change scopes overlap in durable or observed write surfaces.",
+    remediation: ["Treat durable overlap as a planning warning.", "Do not run overlapping observed writes in parallel-safe mode."],
+  },
   {
     prefix: "xml.generic-",
     title: "Generic XML Tag Used Instead Of Unique GRACE Tag",
@@ -136,26 +133,20 @@ const PREFIX_GUIDES: Array<{ prefix: string; title: string; explanation: string;
   {
     prefix: "graph.",
     title: "Knowledge Graph Drift",
-    explanation: "The knowledge graph references modules or verification entries that do not align with the development plan or verification plan.",
-    remediation: ["Refresh docs/knowledge-graph.xml so shared references match the plan and verification artifacts.", "Run $grace-refresh if the drift came from real code changes."],
+    explanation: "The .grace/graph index references modules or entries that do not align with the current verification or filesystem state.",
+    remediation: ["Synchronize GD-* index entries with the actual .grace/graph documents.", "Run $grace-refresh if the drift came from real code changes."],
   },
   {
     prefix: "plan.",
-    title: "Development Plan Drift",
-    explanation: "The development plan is missing modules, verification refs, or step metadata needed for governed execution.",
-    remediation: ["Update docs/development-plan.xml so module IDs, steps, and verification refs match the project reality.", "Use $grace-plan or $grace-refresh when the architecture changed."],
+    title: "Change Plan Drift",
+    explanation: "A GraceChangePlan is missing assertions, scopes, or verification refs needed for governed execution.",
+    remediation: ["Update the GraceChangeSpec and GraceChangePlan so modules, assertions, and verification refs match the current .grace state.", "Use $grace-spec or $grace-plan when the architecture changed."],
   },
   {
     prefix: "analysis.",
     title: "Export Surface Analysis Warning",
     explanation: "The language adapter could not prove the exact export surface or detected a shape that weakens precise linting.",
     remediation: ["Prefer clearer export declarations or explicit ROLE/MAP_MODE overrides when necessary.", "Treat heuristic or wildcard-export warnings as cues to simplify or document the file surface."],
-  },
-  {
-    prefix: "autonomy.",
-    title: "Autonomy Readiness Gate Failure",
-    explanation: "The project is missing one of the packet, verification, or evidence guarantees needed for long autonomous execution.",
-    remediation: ["Strengthen docs/verification-plan.xml, docs/technology.xml, or docs/operational-packets.xml.", "Re-run grace lint --profile autonomous after making the project observable and packet-driven."],
   },
 ];
 
