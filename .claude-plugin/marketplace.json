@@ -51,6 +51,7 @@
         "./skills/grace/grace-reviewer",
         "./skills/grace/grace-migrate",
         "./skills/grace/grace-afk",
+        "./skills/grace/grace-afk-hermes",
         "./skills/grace/grace-ask-human"
       ]
     }

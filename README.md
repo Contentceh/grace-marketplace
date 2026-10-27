@@ -75,6 +75,10 @@ grace --version
 grace lint --path /path/to/grace4-project
 ```
 
+## Hermes setup
+
+Install `grace-afk-hermes` from this marketplace alongside the GRACE skills in the active Hermes profile. The skill expects the normal `grace` CLI; use `grace --help` and `grace afk --help` to confirm commands and flags. The dedicated fork CLI path remains an optional alternative, not another required install. Apply the project's existing `AGENTS.md`/approved plan rules first. The skill runs only within the current bounded turn, uses a profile-safe Telegram-disabled config override and Hermes native `clarify`; it does not provide background execution or restart recovery.
+
 ## GRACE 4 Quick Start
 
 For a new GRACE 4 project:
@@ -114,6 +118,7 @@ Migration cleanup is separately gated: successful current lint, fresh status pro
 | `grace-migrate` | Agent-applied GRACE 3 to GRACE 4 migration with CLI validation |
 | `grace-afk` | Autonomous work mode with a CLI-enforced time budget and an autonomy matrix for act/defer/escalate decisions |
 | `grace-ask-human` | Telegram escalation for one-way-door decisions during autonomous sessions |
+| `grace-afk-hermes` | Bounded continuation of an already-approved GRACE plan in a current Hermes turn; uses native clarify and safe Telegram-disabled config |
 
 ## CLI Overview
 
