@@ -28,6 +28,8 @@
     "src/grace-file.ts",
     "src/project-utils.ts",
     "src/grace.ts",
+    "src/grace-afk.ts",
+    "src/afk",
     "src/grace-lint.ts",
     "src/grace-module.ts",
     "src/grace-status.ts",

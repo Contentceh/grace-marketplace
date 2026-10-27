@@ -11,6 +11,7 @@ import { readFileSync, readdirSync } from "node:fs";
 import path from "node:path";
 import type { ArgDef, CommandDef, Resolvable } from "citty";
 
+import { afkCommand } from "../src/grace-afk.ts";
 import { fileCommand } from "../src/grace-file.ts";
 import { lintCommand } from "../src/grace-lint.ts";
 import { moduleCommand } from "../src/grace-module.ts";
@@ -21,6 +22,7 @@ const repoRoot = path.resolve(import.meta.dir, "..");
 
 /** Subcommands registered on the `grace` binary in src/grace.ts. */
 const rootSubCommands: Record<string, CommandDef> = {
+  afk: afkCommand as CommandDef,
   file: fileCommand as CommandDef,
   lint: lintCommand as CommandDef,
   module: moduleCommand as CommandDef,

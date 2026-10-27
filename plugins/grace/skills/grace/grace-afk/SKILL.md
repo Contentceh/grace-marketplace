@@ -12,9 +12,10 @@ budget expires or the user sends STOP via Telegram.
 You are NOT the budget tracker. The CLI is.
 
 Between every logical step you MUST run `grace afk tick --path <project-root>`. If it exits
-non-zero, your session is over — commit the in-progress work (if any), run `grace afk report`,
-and stop. Do NOT try to estimate remaining budget yourself and keep going. The hard gate is
-the CLI exit code.
+non-zero, the CLI has reported that work must stop — commit the in-progress work (if any), run
+`grace afk report`, and stop. This is a cooperative command/tick boundary, not a process kill:
+the CLI does not interrupt a command or worker already running. Do NOT continue work after the
+expiry report. `budgetPercent` is optional usage telemetry, not a Hermes spend cap.
 </EXTREMELY-IMPORTANT>
 
 ## Prerequisites
@@ -32,7 +33,7 @@ Every subcommand below takes `--path <project-root>` (defaults to `.`).
 | `grace afk start <hours> [<budget%>] [--checkpoint <min>]` | Initialize a session; writes `docs/afk-sessions/<id>/state.json` with `expiresAt`. |
 | `grace afk tick` | CLI-side active-session check. Non-zero exit = session over. |
 | `grace afk ask --title ... --context ... --options "A:...;B:..." --mypick B --confidence 60 [--details "A\|pros\|cons\|opps\|risks;B\|..."] [--wait 120]` | Send a Telegram escalation; returns `{correlationId, messageId}`. Use `;` as a separator (safer across Windows shells) or `\|`. `--details` (5-field SWOT per option) adds a `[📖 Details]` button that sends a follow-up breakdown without cancelling the ask. `--wait N` blocks up to N seconds polling, ack-ing inline-button taps within ~2s so the user's Telegram spinner stops immediately. |
-| `grace afk check --correlation <id> --messageid <n> [--offset <o>]` | Poll Telegram; returns `{status, verb, raw, nextOffset}`. |
+| `grace afk check --correlation <id> --messageid <n>` | Read a cached answer; if still pending and Telegram is configured, poll for replies. |
 | `grace afk journal --class <c> --title ... --rationale ... --outcome ...` | Append to `decisions.md`. |
 | `grace afk defer --question ... --contextLine ...` | Append to `deferred.md`. |
 | `grace afk increment <commits\|escalations\|deferred>` | Update session counters after an action. |
